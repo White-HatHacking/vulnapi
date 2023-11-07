@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 )
 
 type User struct {
@@ -18,27 +21,62 @@ type User struct {
 var userMap = make(map[string]User)
 var mu sync.RWMutex
 
+var (
+	key   = []byte("super-secret-key")
+	store = sessions.NewCookieStore(key)
+)
+
 func main() {
-	r := mux.NewRouter()
+	router := mux.NewRouter() // This object is responsible for routing users that access different pages to different content
 
-	r.HandleFunc("/register", registerHandler).Methods("POST")
-	r.HandleFunc("/login", loginHandler).Methods("POST")
+	// Route GET requests to static content
+	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static/"))))
+	router.PathPrefix("/").HandlerFunc(indexFileHandler("static/"))
 
-	http.Handle("/", r)
+	// Route POST requests to functions
+	router.HandleFunc("/admin/", adminHandler)
+	router.HandleFunc("/register/", registerHandler).Methods("POST")
+	router.HandleFunc("/login/", loginHandler).Methods("POST")
+
+	http.Handle("/", router)
 
 	port := 8080
 	fmt.Printf("Server is running on port %d\n", port)
+	//log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), router))
 	err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func registerHandler(w http.ResponseWriter, r *http.Request) {
+func indexFileHandler(rootDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, request *http.Request) {
+
+		// Get the absolute path to prevent directory traversal
+		path, err := filepath.Abs(request.URL.Path)
+		if err != nil {
+			// If we can't get the absolute path, return a not found error
+			http.NotFound(w, request)
+			return
+		}
+		if strings.HasPrefix(path, filepath.Clean(rootDir)) {
+			http.ServeFile(w, request, filepath.Join(rootDir, request.URL.Path, "index.html"))
+		} else {
+			http.ServeFile(w, request, filepath.Join(rootDir, request.URL.Path)) // serve the file as is
+		}
+	}
+}
+
+func adminHandler(writer http.ResponseWriter, request *http.Request) {
+	http.Error(writer, "Access denied", http.StatusForbidden)
+	//http.ServeFile(writer, request, "static/admin/index.html")
+}
+
+func registerHandler(writer http.ResponseWriter, request *http.Request) {
 	var user User
-	err := json.NewDecoder(r.Body).Decode(&user)
+	err := json.NewDecoder(request.Body).Decode(&user)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -46,20 +84,27 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	if _, exists := userMap[user.Username]; exists {
-		http.Error(w, "User already exists", http.StatusConflict)
+		http.Error(writer, "User already exists", http.StatusConflict)
 		return
 	}
 
 	userMap[user.Username] = user
-	w.WriteHeader(http.StatusCreated)
-	fmt.Println(user)
+	writer.WriteHeader(http.StatusCreated)
+	fmt.Println("User created: \"", user, "\"")
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func loginHandler(writer http.ResponseWriter, request *http.Request) {
 	var user User
-	err := json.NewDecoder(r.Body).Decode(&user)
+	session, err := store.Get(request, "session-name")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Printf("Error retrieving session: %v", err)
+		http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	err = json.NewDecoder(request.Body).Decode(&user)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -68,9 +113,21 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	storedUser, exists := userMap[user.Username]
 	if !exists || storedUser.Password != user.Password {
-		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+		http.Error(writer, "Invalid username or password", http.StatusUnauthorized)
+		fmt.Println("User failed to login: \"", user, "\"")
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	if user.Username == "admin" {
+		session.Values["authenticated"] = true
+		// onBolaExploited()
+		if err := session.Save(request, writer); err != nil {
+			// Handle errors saving the session
+			log.Printf("Error saving session: %v", err)
+			http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	fmt.Println("User logged in: \"", user, "\"")
 }
